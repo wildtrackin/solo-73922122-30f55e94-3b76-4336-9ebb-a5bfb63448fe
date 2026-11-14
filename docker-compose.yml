@@ -1,0 +1,57 @@
+services:
+  api-a:
+    build: .
+    image: municipal-gis-api:latest
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8001:8000"
+    environment:
+      GIS_DB_PATH: /data/gis.db
+      GIS_BUSY_TIMEOUT_S: "30"
+    volumes:
+      - gis-data:/data
+    healthcheck:
+      test: ["CMD", "python", "app/healthcheck.py"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+
+  api-b:
+    build: .
+    image: municipal-gis-api:latest
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8002:8000"
+    environment:
+      GIS_DB_PATH: /data/gis.db
+      GIS_BUSY_TIMEOUT_S: "30"
+    volumes:
+      - gis-data:/data
+    healthcheck:
+      test: ["CMD", "python", "app/healthcheck.py"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+
+  # One-shot demo runner:
+  #   docker compose --profile demo run --rm demo
+  demo:
+    build: .
+    image: municipal-gis-api:latest
+    profiles: ["demo"]
+    restart: "no"
+    depends_on:
+      api-a:
+        condition: service_healthy
+      api-b:
+        condition: service_healthy
+    volumes:
+      - gis-data:/data
+    environment:
+      GIS_DB_PATH: /data/gis.db
+    command: ["python", "-m", "examples.run_demo", "--base-a", "http://api-a:8000", "--base-b", "http://api-b:8000"]
+
+volumes:
+  gis-data:
