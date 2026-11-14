@@ -27,6 +27,7 @@ from typing import Iterable, Sequence
 from .config import settings
 from .db import read_tx, write_tx
 from .geometry import assemble as _assemble
+from .indexstore import STATUS_READY, apply_geometry, catalog_status, mark_dirty
 from .schemas import BatchIn, BatchResult, PointIn, RoadOut
 
 CHUNK = 400
@@ -239,9 +240,32 @@ def write_refs(conn, road_id: str, current: list[str], wanted: list[str]) -> Non
     )
 
 
+def _apply_index(conn, plan: Plan) -> str:
+    """Maintain the persistent spatial catalog inside the batch transaction.
+
+    Ready: rtree entries are updated in the same transaction as the point
+    values and geometries, so all three commit or roll back together.
+    Building: the batch only appends the touched road ids to ``index_dirty``;
+    the background backfill reconciles them against the committed state.
+    Returns the mode the catalog is in (visible in the batch result).
+    """
+    changed = [r for r in plan.roads if r.changed]
+    if not changed and not plan.road_deletes:
+        return catalog_status(conn)
+    mode = catalog_status(conn)
+    if mode == STATUS_READY:
+        for road in changed:
+            apply_geometry(conn, road.road_id, road.geometry)
+        for rid in plan.road_deletes:
+            apply_geometry(conn, rid, None)
+    else:
+        mark_dirty(conn, [r.road_id for r in changed] + list(plan.road_deletes))
+    return mode
+
+
 def _apply(
     conn, plan: Plan, stamp: str, inject_failure: bool
-) -> tuple[list[RoadOut], int]:
+) -> tuple[list[RoadOut], int, str]:
     written = [r for r in plan.roads if r.changed]
 
     for pid, lon, lat in plan.point_writes:
@@ -307,9 +331,11 @@ def _apply(
             )
         )
 
+    index_mode = _apply_index(conn, plan)
+
     if inject_failure:
-        # Issued after every write, immediately before COMMIT: proves the
-        # whole batch (points, references and geometry) is rolled back.
+        # Issued after every write (points, geometry AND catalog entries),
+        # immediately before COMMIT: proves the whole batch is rolled back.
         raise DemoFailure("injected failure before commit; transaction rolled back")
 
     if written or plan.point_writes or plan.point_deletes or plan.road_deletes:
@@ -317,7 +343,7 @@ def _apply(
         # computed from the pre-commit state, forcing it to recompute instead
         # of writing stale geometry back.
         conn.execute("UPDATE store_meta SET generation = generation + 1 WHERE id = 1")
-    return out, new_roads
+    return out, new_roads, index_mode
 
 
 def execute_batch(
@@ -345,7 +371,9 @@ def execute_batch(
                 )
                 if current != plan.generation:
                     raise RetryPlanned()
-                roads_out, new_roads = _apply(conn, plan, stamp, inject_failure)
+                roads_out, new_roads, index_mode = _apply(
+                    conn, plan, stamp, inject_failure
+                )
         except RetryPlanned:
             # small jittered backoff before replanning from a fresh snapshot
             time.sleep(min(0.02 * attempt, 0.2))
@@ -360,6 +388,7 @@ def execute_batch(
             affected_road_ids=sorted(r.road_id for r in plan.roads if r.changed),
             roads=sorted(roads_out, key=lambda r: r.id),
             commit_attempts=attempt,
+            index_mode=index_mode,
         )
         return result, attempt
     raise ConcurrentConflict(
@@ -390,18 +419,7 @@ def get_point(conn, point_id: str) -> PointIn | None:
     return None if row is None else PointIn(id=row["id"], lon=row["lon"], lat=row["lat"])
 
 
-def list_roads(conn, road_id: str | None = None) -> list[RoadOut]:
-    if road_id is None:
-        rows = conn.execute(
-            "SELECT id, geometry, missing_point_ids, revision, updated_at FROM roads "
-            "ORDER BY id"
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT id, geometry, missing_point_ids, revision, updated_at FROM roads "
-            "WHERE id = ?",
-            (road_id,),
-        ).fetchall()
+def _roads_from_rows(conn, rows) -> list[RoadOut]:
     if not rows:
         return []
     refs_by_road: dict[str, list[str]] = {}
@@ -428,3 +446,39 @@ def list_roads(conn, road_id: str | None = None) -> list[RoadOut]:
             )
         )
     return out
+
+
+def list_roads(conn, road_id: str | None = None) -> list[RoadOut]:
+    if road_id is None:
+        rows = conn.execute(
+            "SELECT id, geometry, missing_point_ids, revision, updated_at FROM roads "
+            "ORDER BY id"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, geometry, missing_point_ids, revision, updated_at FROM roads "
+            "WHERE id = ?",
+            (road_id,),
+        ).fetchall()
+    return _roads_from_rows(conn, rows)
+
+
+def list_roads_by_ids(conn, road_ids: Sequence[str]) -> list[RoadOut]:
+    """Fetch persisted roads for a candidate set, in id order.
+
+    Used by the range query: the rtree pre-filter and this read run in the
+    same read transaction, so candidates and geometries come from one
+    committed snapshot.
+    """
+    rows = []
+    for chunk in _chunks(sorted(road_ids)):
+        marks = ",".join("?" * len(chunk))
+        rows.extend(
+            conn.execute(
+                "SELECT id, geometry, missing_point_ids, revision, updated_at "
+                f"FROM roads WHERE id IN ({marks}) ORDER BY id",
+                chunk,
+            ).fetchall()
+        )
+    rows.sort(key=lambda r: r["id"])
+    return _roads_from_rows(conn, rows)

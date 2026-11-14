@@ -150,6 +150,9 @@ class BatchResult(BaseModel):
     affected_road_ids: list[str] = Field(description="本批次影响到的全部路段 ID（均已持久化到最终状态）")
     roads: list["RoadOut"] = Field(description="受影响路段的最终状态，按 ID 升序")
     commit_attempts: int = Field(default=1, description="提交尝试次数；>1 表示规划期间检测到并发提交并已整体重算")
+    index_mode: Literal["ready", "building"] = Field(
+        description="空间目录模式：ready=本批已同步更新 RTree 目录；building=变更已记入补建队列，由后台补建复核"
+    )
 
 
 class RoadOut(BaseModel):
@@ -178,6 +181,41 @@ class StateResponse(BaseModel):
     generation: int
     points: list[PointIn]
     roads: list[RoadOut]
+
+
+class SpatialWindow(BaseModel):
+    """不跨 180° 经线的 WGS84 闭矩形查询窗口。"""
+
+    min_lon: float = Field(description="窗口西边界经度（含）")
+    min_lat: float = Field(description="窗口南边界纬度（含）")
+    max_lon: float = Field(description="窗口东边界经度（含）")
+    max_lat: float = Field(description="窗口北边界纬度（含）")
+
+
+class SpatialRoadsResponse(BaseModel):
+    """与闭矩形相交的完整路段（GeoJSON 不裁剪），来自同一已提交快照。"""
+
+    window: SpatialWindow
+    roads: list[RoadOut] = Field(description="与窗口相交的完整路段（含完整线形，按 ID 升序）")
+    total: int
+
+
+class IndexStatusResponse(BaseModel):
+    """空间目录补建进度。"""
+
+    status: Literal["building", "ready"] = Field(
+        description="building=后台补建中（范围查询被拒绝）；ready=目录完整可用"
+    )
+    ready: bool
+    paused: bool = Field(description="补建是否被演示/运维开关暂停")
+    scanned: int = Field(description="游标扫描已处理的路段数")
+    pending_changes: int = Field(description="补建期间发生、待后台复核的路段变更数")
+    total_roads: int = Field(description="当前路段总数（实时）")
+    scan_cursor: str = Field(description="扫描游标（已处理到的路段 ID）")
+    owner: str | None = Field(description="当前持有补建租约的进程（hostname:pid）")
+    started_at: str | None
+    updated_at: str | None
+    ready_at: str | None
 
 
 class HealthResponse(BaseModel):

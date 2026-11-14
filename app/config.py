@@ -25,5 +25,14 @@ class Settings:
     max_commit_attempts: int = field(
         default_factory=lambda: _int("GIS_MAX_COMMIT_ATTEMPTS", 12)
     )
+    backfill_chunk: int = field(
+        default_factory=lambda: _int("GIS_BACKFILL_CHUNK", 200)
+    )
+    backfill_lease_s: float = field(
+        default_factory=lambda: _float("GIS_BACKFILL_LEASE_S", 5.0)
+    )
+    backfill_step_interval_ms: int = field(
+        default_factory=lambda: _int("GIS_BACKFILL_STEP_INTERVAL_MS", 50)
+    )
 
 settings = Settings()

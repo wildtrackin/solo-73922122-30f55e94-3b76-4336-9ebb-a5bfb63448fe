@@ -8,6 +8,10 @@ services:
     environment:
       GIS_DB_PATH: /data/gis.db
       GIS_BUSY_TIMEOUT_S: "30"
+      # spatial-catalog backfill tuning (all optional, defaults shown)
+      GIS_BACKFILL_CHUNK: "200"
+      GIS_BACKFILL_LEASE_S: "5"
+      GIS_BACKFILL_STEP_INTERVAL_MS: "50"
     volumes:
       - gis-data:/data
     healthcheck:
@@ -26,6 +30,9 @@ services:
     environment:
       GIS_DB_PATH: /data/gis.db
       GIS_BUSY_TIMEOUT_S: "30"
+      GIS_BACKFILL_CHUNK: "200"
+      GIS_BACKFILL_LEASE_S: "5"
+      GIS_BACKFILL_STEP_INTERVAL_MS: "50"
     volumes:
       - gis-data:/data
     healthcheck:

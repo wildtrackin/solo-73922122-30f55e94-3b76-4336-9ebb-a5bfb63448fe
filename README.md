@@ -1,7 +1,8 @@
 # 市政道路线形加工服务
 
-测绘队共享测点 → 路段线形（GeoJSON LineString）加工与入库服务。
-FastAPI + SQLite（WAL），两个 API 进程共用一个数据库文件，Docker Compose 一键启动。
+测绘队共享测点 → 路段线形（GeoJSON LineString）加工与入库服务，带**持久化空间目录**的
+地图视窗范围查询。FastAPI + SQLite（WAL + RTree），两个 API 进程共用一个数据库文件，
+Docker Compose 一键启动。
 
 ## 启动
 
@@ -12,6 +13,7 @@ docker compose up --build -d
 * API A：<http://localhost:8001>  Swagger UI：<http://localhost:8001/docs>
 * API B：<http://localhost:8002>  Swagger UI：<http://localhost:8002/docs>
 * 两个进程共用卷 `gis-data:/data/gis.db`（命名卷，`docker compose down` 不会丢数据；要清空请 `docker compose down -v`）。
+* `/docs` 里可直接试范围查询（`GET /api/v1/spatial/roads`）与补建进度（`GET /api/v1/index/status`）。
 
 跑一遍样例（可选，会自动做在线演示，见文末）：
 
@@ -19,11 +21,12 @@ docker compose up --build -d
 docker compose --profile demo run --rm demo
 ```
 
-重启验证（数据仍在）：
+重启验证（数据与空间目录仍在）：
 
 ```bash
 docker compose restart api-a api-b
 curl -s http://localhost:8001/api/v1/state | head -c 400
+curl -s http://localhost:8001/api/v1/index/status
 ```
 
 ## 接口
@@ -34,7 +37,48 @@ curl -s http://localhost:8001/api/v1/state | head -c 400
 | GET | `/api/v1/state` | **一个读快照**返回全部测点原值 + 全部已持久化线形（含 `generation`） |
 | GET | `/api/v1/points` / `/api/v1/points/{id}` | 查询测点 |
 | GET | `/api/v1/roads` / `/api/v1/roads/{id}` | 查询路段（只读已持久化的 `geometry`，不现场组线） |
+| GET | `/api/v1/spatial/roads` | **范围查询**：不跨 180° 经线的 WGS84 闭矩形 → 相交的完整路段 GeoJSON + ID |
+| GET | `/api/v1/index/status` | 空间目录补建进度（状态/已扫描/待复核/持约进程） |
+| POST | `/api/v1/index/pause?paused=` | 演示/运维开关：暂停或恢复后台补建扫描 |
+| POST | `/api/v1/index/rebuild?pause=` | 运维/演示：整体重建空间目录（可指定先暂停扫描） |
 | GET | `/health` | 健康检查（含 WAL 模式） |
+
+### 范围查询（地图视窗加载）
+
+```
+GET /api/v1/spatial/roads?min_lon=116.39&min_lat=39.90&max_lon=116.42&max_lat=39.92
+```
+
+* 窗口为**不跨 180° 经线**的 WGS84 矩形：`min_lon ≤ max_lon`、`min_lat ≤ max_lat`，
+  经纬度平面判定；要查跨 180° 的区域请拆成两个窗口分别查询。
+* 返回与**闭矩形**相交的**完整路段**（GeoJSON 不裁剪）及 ID，按 ID 升序；
+  边界压线也算命中。
+* **道路穿过窗口但顶点均在窗外也命中**：精确判定在线段级（线段与矩形相交），
+  不是简单的"顶点在窗口内"。
+* **缺点路段（incomplete）不进入目录**，不会被范围查询返回。
+* 实现：先用持久化的 **SQLite RTree** 空间目录筛候选，再对候选的**已持久化线形**
+  做精确相交判定——不扫描全路网、不临时组线；候选筛选与线形取自**同一个读快照**，
+  即同一已提交状态。
+* 空间目录**未就绪时返回 409**（响应体含当前进度），请先查 `/api/v1/index/status`。
+
+### 空间目录与后台补建
+
+* 目录 = `road_rtree`（RTree 虚表，存每条完整路段的包围盒）+ `road_index_map`
+  （文本路段 ID ↔ RTree 整数 ID）。随库文件持久化，重启不丢。
+* **就绪（ready）后**：每个批次的测点原值、线形与目录条目在**同一个写事务**里
+  提交或回滚（批次响应里 `index_mode: "ready"`）。
+* **历史数据后台补建（building）**：首次升级/重建时，后台线程按 ID 游标分块扫描
+  全路网并写入目录；`/api/v1/index/status` 可查 `scanned`、`pending_changes`、
+  `total_roads` 等进度。就绪前范围查询一律 409。
+* **补建期间入库照常**：批次增/改/删（含同 ID 删后重建）只把路段 ID 记入
+  `index_dirty` 队列（`index_mode: "building"`），后台按**当前已提交状态**复核补齐；
+  扫描写回前会在写事务内逐条比对持久化线形，**旧扫描不会覆盖新状态、也不会漏记路段**。
+* **扫描与相交计算不持写锁**：扫描在短读快照上进行，包围盒计算在事务外；
+  写事务只做"校验 + 落条目"，毫秒级。
+* **中断自动接续**：游标、队列、状态全部持久化；进程被杀或容器重启后，
+  后台线程从断点继续，**未真正完成前绝不置 ready**。
+* **双进程协调**：两个 API 进程都跑补建线程，用 `index_meta` 里的租约
+  （`owner`/`lease_until`）保证同一时刻只有一个在扫描，另一个待机接管。
 
 批次请求体（所有字段可选，按 `points → roads → delete_roads → delete_points` 顺序生效）：
 
@@ -76,7 +120,9 @@ curl -s http://localhost:8001/api/v1/state | head -c 400
 3. **影响面完整**：更正/删除测点、改变路段引用时，所有受影响路段（含引用该测点的全部路段）在
    **同一事务**里重算；未受影响的路段不重写（`revision` 不变）。
 4. **整批原子**：批次中途任何异常（含写完后注入）整体回滚，`generation` 不前进，库保持原状。
-5. **重启保留**：SQLite 文件在命名卷里，`docker compose restart` / 重建容器后数据仍在。
+5. **目录随批一致**：就绪后每个批次把测点原值、线形、RTree 目录条目放在**同一个写事务**里
+   提交或回滚；范围查询的候选筛选与返回线形取自同一读快照，即同一已提交状态。
+6. **重启保留**：SQLite 文件在命名卷里，`docker compose restart` / 重建容器后数据与空间目录仍在。
 
 ## 并发模型（两个进程共库）
 
@@ -88,6 +134,8 @@ curl -s http://localhost:8001/api/v1/state | head -c 400
   绝不把基于旧坐标算出的线形写回库；并发新增 / 改引用的路段也在重算中被重新纳入，
   不会漏更新。
 * **读一致性**：`/api/v1/state` 在一个延迟事务里完成全部读取，返回的测点原值与线形必定来自同一已提交状态。
+* **补建不挡入库**：后台补建的扫描与包围盒计算都在写事务之外；写事务只做毫秒级的
+  "校验 + 落条目"。范围查询的精确相交判定也发生在读快照上，不持写锁。
 * WAL 下读者不阻塞写者、写者不阻塞读者；`synchronous=FULL` 保证已提交数据断电安全。
 
 ## 本地运行与测试
@@ -104,8 +152,11 @@ pytest            # 功能 + 双进程并发（测试会真的起两个 API 进�
 `tests/server_runner.py` 起两个独立进程，连接同一个 SQLite 文件。）
 
 `tests/test_concurrency.py` 起两个真实 API 进程共库运行：跨进程一致性、暂停组线不持写锁、
-并发改线无漏更新/旧坐标、`/state` 在持续写入下的快照一致性；
-`tests/test_retry.py` 用可控方式制造"规划后另一进程提交"，断言旧规划被丢弃并重算。
+并发改线无漏更新/旧坐标、`/state` 在持续写入下的快照一致性、空间目录跨进程共享与
+"重建暂停时改线不丢不旧"；
+`tests/test_retry.py` 用可控方式制造"规划后另一进程提交"，断言旧规划被丢弃并重算；
+`tests/test_spatial.py` 覆盖闭矩形相交判定（含穿越窗口、压边界）、范围查询就绪门禁、
+补建暂停/恢复/重启接续、旧扫描不覆盖新状态、目录随批次回滚。
 
 ## 演示样例（要点）
 
@@ -119,7 +170,12 @@ pytest            # 功能 + 双进程并发（测试会真的起两个 API 进�
    （用时 < 1s，未被写锁阻塞）；A 提交时发现代号已变，整批重算后 `commit_attempts=2`，
    重算结果把 B 新建的 RD-105 一并纳入（`affected_road_ids` 含 RD-103/104/105），
    两条路段与 PT-006 原值一致；
-6. `fail=true` 批次写完后抛错 → 整体回滚，`/state` 与失败前逐字段一致。
+6. `fail=true` 批次写完后抛错 → 整体回滚，`/state` 与失败前逐字段一致；
+7. **范围查询**：视窗内命中完整路段；RD-CROSS 斜穿小视窗、两端点都在窗外也命中；
+   删除测点使路段 incomplete 后立即被范围查询排除，补点后自动回到目录；
+8. **扫描暂停时改线**：`POST /api/v1/index/rebuild?pause=true` 重建并暂停扫描 →
+   范围查询 409 → B 在暂停期间改线 + 新建路段（`index_mode=building`，变更进入复核队列）
+   → 恢复扫描 → 补建自动接续至就绪 → 范围查询按**新坐标**命中改过的线形与新建路段。
 
 本地直接跑（不用 compose）：
 
@@ -127,6 +183,17 @@ pytest            # 功能 + 双进程并发（测试会真的起两个 API 进�
 uvicorn app.main:app --port 8001 &  uvicorn app.main:app --port 8002 &
 python -m examples.run_demo --base-a http://localhost:8001 --base-b http://localhost:8002
 ```
+
+## 环境变量
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `GIS_DB_PATH` | `/data/gis.db` | SQLite 数据库文件路径 |
+| `GIS_BUSY_TIMEOUT_S` | `30` | 写锁等待超时（秒） |
+| `GIS_MAX_COMMIT_ATTEMPTS` | `12` | 乐观提交最大重试次数 |
+| `GIS_BACKFILL_CHUNK` | `200` | 补建每步处理的路段数 |
+| `GIS_BACKFILL_LEASE_S` | `5` | 补建租约时长（秒），宕机后另一进程接管 |
+| `GIS_BACKFILL_STEP_INTERVAL_MS` | `50` | 补建步进间隔（毫秒），调大可观察 building 状态 |
 
 ## 说明
 

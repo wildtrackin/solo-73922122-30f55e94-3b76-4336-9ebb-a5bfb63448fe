@@ -10,7 +10,12 @@ a black-box acceptance check of the delivered environment:
 5. a deliberately paused batch on A (assembly outside any write lock) runs
    while B keeps ingesting and repointing roads;
 6. a failed batch rolls back; the final state is then re-read from B, and
-   snapshots are validated against the persisted values.
+   snapshots are validated against the persisted values;
+7. the spatial catalog serves viewport range queries (roads piercing the
+   window with all vertices outside are hit; incomplete roads are excluded);
+8. the catalog is rebuilt with the scan paused: lines keep changing via the
+   other process, range queries are rejected (409) until the backfill
+   finishes, and the resumed scan indexes the NEW committed lines.
 
 Run locally::
 
@@ -62,6 +67,45 @@ class Api:
         r.raise_for_status()
         return r.json()
 
+    def spatial(self, min_lon, min_lat, max_lon, max_lat, expect=200) -> dict:
+        r = self.http.get(
+            "/api/v1/spatial/roads",
+            params={
+                "min_lon": min_lon,
+                "min_lat": min_lat,
+                "max_lon": max_lon,
+                "max_lat": max_lat,
+            },
+        )
+        assert r.status_code == expect, f"{r.status_code}: {r.text}"
+        return r.json()
+
+    def index_status(self) -> dict:
+        r = self.http.get("/api/v1/index/status")
+        r.raise_for_status()
+        return r.json()
+
+    def index_pause(self, paused: bool) -> dict:
+        r = self.http.post("/api/v1/index/pause", params={"paused": str(paused).lower()})
+        r.raise_for_status()
+        return r.json()
+
+    def index_rebuild(self, pause: bool) -> dict:
+        r = self.http.post("/api/v1/index/rebuild", params={"pause": str(pause).lower()})
+        r.raise_for_status()
+        return r.json()
+
+
+def wait_ready(api: Api, timeout: float = 60.0) -> dict:
+    deadline = time.time() + timeout
+    st = None
+    while time.time() < deadline:
+        st = api.index_status()
+        if st["ready"]:
+            return st
+        time.sleep(0.2)
+    raise SystemExit(f"spatial catalog did not become ready: {st}")
+
 
 def _run(args) -> None:
     a = Api(args.base_a)
@@ -94,7 +138,9 @@ def _run(args) -> None:
         {"points": [{"id": "PT-003", "lon": 116.417800, "lat": 39.919200}]}
     )
     pretty("4. 更正 PT-003（改由 API B 提交）：两条引用它的路段同时生效", corrected)
-    assert sorted(corrected["affected_road_ids"]) == ["RD-101", "RD-102"]
+    # RD-101/RD-102 must be fan-out updated; later demo steps add RD-PAUSED,
+    # which also references PT-003, so re-runs may list it as well
+    assert {"RD-101", "RD-102"} <= set(corrected["affected_road_ids"])
 
     # -- 5 --------------------------------------------------------------
     # Paused batch on A: it reports affected roads based on the snapshot it
@@ -179,7 +225,85 @@ def _run(args) -> None:
             },
         },
     )
-    print("\n演示完成。重启 api-a / api-b 后上述数据仍在（SQLite WAL 持久化）。")
+
+    # -- 7 --------------------------------------------------------------
+    st = wait_ready(a)
+    pretty("7. 空间目录后台补建完成（GET /api/v1/index/status）", st)
+
+    # a viewport window over the PT-001..PT-003 corridor
+    win = a.spatial(116.390, 39.905, 116.420, 39.920)
+    pretty(
+        "范围查询：视窗 [116.390,39.905 ~ 116.420,39.920] 内命中的完整路段",
+        {"total": win["total"], "ids": [r["id"] for r in win["roads"]]},
+    )
+    assert "RD-101" in {r["id"] for r in win["roads"]}
+
+    # a road that pierces the window with ALL vertices outside must still hit
+    a.batch(
+        {
+            "points": [
+                {"id": "PT-X1", "lon": 116.390, "lat": 39.900},
+                {"id": "PT-X2", "lon": 116.460, "lat": 39.940},
+            ],
+            "roads": [{"id": "RD-CROSS", "point_ids": ["PT-X1", "PT-X2"]}],
+        }
+    )
+    cross = a.spatial(116.410, 39.912, 116.430, 39.922)
+    pretty(
+        "RD-CROSS 斜穿小视窗、两个端点都在窗外：依然命中（线段穿越判定）",
+        {"window": cross["window"], "ids": [r["id"] for r in cross["roads"]]},
+    )
+    assert "RD-CROSS" in {r["id"] for r in cross["roads"]}
+
+    # incomplete roads never leave the catalog
+    a.batch({"delete_points": ["PT-X2"]})
+    gone = a.spatial(116.410, 39.912, 116.430, 39.922)
+    assert "RD-CROSS" not in {r["id"] for r in gone["roads"]}
+    pretty("删除 PT-X2 后 RD-CROSS 转为 incomplete：范围查询立即排除", {"ids": [r["id"] for r in gone["roads"]]})
+    a.batch({"points": [{"id": "PT-X2", "lon": 116.460, "lat": 39.940}]})
+    back = a.spatial(116.410, 39.912, 116.430, 39.922)
+    assert "RD-CROSS" in {r["id"] for r in back["roads"]}
+    print("    补回 PT-X2 后 RD-CROSS 自动恢复并重新进入目录。")
+
+    # -- 8 --------------------------------------------------------------
+    print("\n=== 8. 重建目录并暂停扫描：演示“扫描暂停时改线” " + "=" * 20)
+    st = a.index_rebuild(pause=True)
+    pretty("POST /api/v1/index/rebuild?pause=true：目录回到 building 并暂停扫描", st)
+
+    blocked = a.spatial(116.390, 39.905, 116.460, 39.940, expect=409)
+    pretty("目录未就绪：范围查询被拒绝（409）", blocked)
+
+    # the other process keeps editing lines while the scan is paused
+    moved = b.batch(
+        {
+            "points": [{"id": "PT-003", "lon": 116.418500, "lat": 39.920500}],
+            "roads": [{"id": "RD-PAUSED", "point_ids": ["PT-003", "PT-X1"]}],
+        }
+    )
+    pretty(
+        "暂停期间 B 改线（PT-003 移动）并新建 RD-PAUSED：入库照常，"
+        f"变更进入补建队列（index_mode={moved['index_mode']}）",
+        {"affected_road_ids": moved["affected_road_ids"], "index_mode": moved["index_mode"]},
+    )
+    st = a.index_status()
+    pretty("进度查询：扫描暂停中，变更待复核", st)
+    assert st["status"] == "building" and st["pending_changes"] >= 2
+
+    a.index_pause(False)
+    st = wait_ready(a)
+    pretty("恢复扫描后补建自动接续直至就绪", st)
+
+    hit = b.spatial(116.415, 39.918, 116.425, 39.925)
+    ids = {r["id"] for r in hit["roads"]}
+    pretty(
+        "就绪后范围查询：改过的线形按新坐标命中，新建路段也在目录中",
+        {"window": hit["window"], "ids": sorted(ids)},
+    )
+    assert "RD-101" in ids and "RD-PAUSED" in ids
+    rd101 = next(r for r in hit["roads"] if r["id"] == "RD-101")
+    assert [116.4185, 39.9205] in rd101["geometry"]["coordinates"], "旧扫描覆盖了新线形！"
+
+    print("\n演示完成。重启 api-a / api-b 后上述数据与空间目录仍在（SQLite WAL 持久化）。")
 
 
 def main(argv=None) -> int:

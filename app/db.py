@@ -56,6 +56,41 @@ CREATE TABLE IF NOT EXISTS store_meta (
     generation  INTEGER NOT NULL
 );
 INSERT OR IGNORE INTO store_meta(id, generation) VALUES (1, 0);
+
+-- ---------------------------------------------------------------------------
+-- Persistent spatial catalog (see app/indexstore.py for the access layer):
+-- road_rtree holds one bounding box per complete road, road_index_map maps
+-- text road ids to integer rtree ids, index_dirty tracks roads changed while
+-- the catalog is being (re)built, index_meta carries the backfill state.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS road_index_map (
+    road_id  TEXT PRIMARY KEY,
+    entry_id INTEGER NOT NULL UNIQUE
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS road_rtree USING rtree(
+    entry_id,
+    min_lon, max_lon,
+    min_lat, max_lat
+);
+
+CREATE TABLE IF NOT EXISTS index_dirty (
+    road_id TEXT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS index_meta (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    status      TEXT NOT NULL DEFAULT 'building',   -- building | ready
+    scan_cursor TEXT NOT NULL DEFAULT '',
+    scanned     INTEGER NOT NULL DEFAULT 0,
+    paused      INTEGER NOT NULL DEFAULT 0,
+    owner       TEXT,
+    lease_until REAL NOT NULL DEFAULT 0,
+    started_at  TEXT,
+    updated_at  TEXT,
+    ready_at    TEXT
+);
+INSERT OR IGNORE INTO index_meta(id, status) VALUES (1, 'building');
 """
 
 
